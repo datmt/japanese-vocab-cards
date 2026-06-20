@@ -66,6 +66,14 @@ body {
   padding: 0.6rem 0.9rem;
   cursor: pointer;
 }
+.word-row .word-thumb {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+  align-self: center;
+}
 .word-row .rank {
   color: #999;
   font-size: 0.8rem;

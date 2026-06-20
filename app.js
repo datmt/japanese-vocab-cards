@@ -55,7 +55,7 @@ function renderSidebar() {
 function renderChunk(start, end) {
   activeChunk = { start, end };
   const words = queryAll(
-    'SELECT rank, headword, reading_llm, reading_dict, gloss, mnemonic, has_kanji FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
+    'SELECT rank, headword, reading_llm, reading_dict, gloss, mnemonic, has_kanji, image_path FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
     [start, end]
   );
 
@@ -84,6 +84,7 @@ function renderWordRow(w) {
   summary.className = 'word-summary';
   const reading = w.reading_llm || w.reading_dict || '';
   summary.innerHTML = `
+    ${w.image_path ? `<img class="word-thumb" src="${escapeHtml(w.image_path)}" alt="" loading="lazy">` : ''}
     <span class="rank">#${w.rank}</span>
     <span class="headword">${escapeHtml(w.headword)}</span>
     <span class="reading">${escapeHtml(reading)}</span>
