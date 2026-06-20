@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build a SQLite vocab database from corpus.txt, enriched via Ollama LLM.
+"""Build a SQLite vocab database from corpus.txt, enriched via an LLM.
 
-For each of the ~5000 ranked entries in corpus.txt, calls a local Ollama
-model to generate: a reading (kana), N example sentences (jp + reading + en),
-and a kanji mnemonic (only for words containing kanji). The LLM-generated
-reading is cross-checked against SudachiPy's dictionary reading; mismatches
-are flagged but both readings are kept.
+For each of the ~5000 ranked entries in corpus.txt, calls an LLM (OpenRouter
+by default, or a local Ollama instance) to generate: a reading (kana), N
+example sentences (jp + reading + en), and a kanji mnemonic (only for words
+containing kanji). The LLM-generated reading is cross-checked against
+SudachiPy's dictionary reading; mismatches are flagged but both readings
+are kept.
 
 Resumable: progress is tracked per-row in the `words.status` column, so
 re-running the script skips already-completed rows and retries
@@ -13,6 +14,7 @@ pending/errored ones.
 """
 import argparse
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -23,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from sudachipy import dictionary
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 KANJI_RE = re.compile(r"[一-鿿]")
 RANK_LINE_RE = re.compile(r"^(\d+)\t(.+?)\t(.+?)\t(.+?)\t(.+)$")
@@ -151,7 +155,16 @@ Return JSON with this exact shape:
 """
 
 
-def call_ollama(host, model, prompt, timeout=120):
+def extract_json(content):
+    """Strip markdown code fences some providers wrap JSON in, then parse."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    return json.loads(content)
+
+
+def call_ollama(host, model, prompt, timeout=300, think=False):
     resp = requests.post(
         f"{host}/api/chat",
         json={
@@ -159,13 +172,44 @@ def call_ollama(host, model, prompt, timeout=120):
             "messages": [{"role": "user", "content": prompt}],
             "format": "json",
             "stream": False,
+            "think": think,
             "options": {"temperature": 0.3},
         },
         timeout=timeout,
     )
     resp.raise_for_status()
     content = resp.json()["message"]["content"]
-    return json.loads(content)
+    return extract_json(content)
+
+
+def call_openrouter(model, prompt, timeout=300, think=False):
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY not set in environment")
+    resp = requests.post(
+        OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "reasoning": {"enabled": think},
+            "temperature": 0.3,
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"openrouter error: {data['error']}")
+    content = data["choices"][0]["message"]["content"]
+    return extract_json(content)
+
+
+def call_llm(backend, host, model, prompt, timeout=300, think=False):
+    if backend == "openrouter":
+        return call_openrouter(model, prompt, timeout=timeout, think=think)
+    return call_ollama(host, model, prompt, timeout=timeout, think=think)
 
 
 _thread_local = threading.local()
@@ -189,12 +233,12 @@ def dict_reading(headword):
         return ""
 
 
-def compute_row(host, model, n_examples, row):
+def compute_row(backend, host, model, n_examples, row, timeout=300, think=False):
     """Network/CPU work only, no DB access — safe to run from worker threads."""
     rank = row["rank"]
     prompt = build_prompt(row["word"], row["pos"], row["gloss"], row["has_kanji"], n_examples)
     try:
-        data = call_ollama(host, model, prompt)
+        data = call_llm(backend, host, model, prompt, timeout=timeout, think=think)
         reading_llm = normalize_reading(data.get("reading", ""))
         examples = data.get("examples", [])[:n_examples]
         if not reading_llm or not examples:
@@ -252,16 +296,25 @@ def persist_result(conn, row, result, max_attempts):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build Japanese vocab SQLite DB via Ollama LLM enrichment.")
+    ap = argparse.ArgumentParser(description="Build Japanese vocab SQLite DB via LLM enrichment.")
     ap.add_argument("--corpus", default="corpus.txt")
     ap.add_argument("--db", default="vocab.db")
-    ap.add_argument("--host", default="http://gb10-001:11434")
-    ap.add_argument("--model", default="qwen3.6:35b-a3b")
+    ap.add_argument("--backend", choices=["openrouter", "ollama"], default="openrouter")
+    ap.add_argument("--host", default="http://gb10-001:11434", help="ollama host (ignored for openrouter backend)")
+    ap.add_argument("--model", default=None, help="defaults to qwen/qwen3.6-35b-a3b (openrouter) or qwen3.6:35b-a3b (ollama)")
     ap.add_argument("--examples", type=int, default=2, help="number of example sentences per word")
     ap.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS_DEFAULT)
     ap.add_argument("--limit", type=int, default=None, help="only process N rows (testing)")
-    ap.add_argument("--workers", type=int, default=1, help="parallel ollama requests in flight")
+    ap.add_argument("--workers", type=int, default=1, help="parallel LLM requests in flight")
+    ap.add_argument("--timeout", type=int, default=300, help="per-request LLM timeout in seconds")
+    ap.add_argument("--retry-backoff", type=float, default=3.0, help="seconds to wait before retrying errored rows")
+    ap.add_argument("--think", action="store_true", help="enable model reasoning/thinking (slower, ~10-15x; default off)")
     args = ap.parse_args()
+
+    if args.model is None:
+        args.model = "qwen/qwen3.6-35b-a3b" if args.backend == "openrouter" else "qwen3.6:35b-a3b"
+    if args.backend == "openrouter" and not os.environ.get("OPENROUTER_API_KEY"):
+        sys.exit("OPENROUTER_API_KEY not set in environment (required for --backend openrouter)")
 
     rows = parse_corpus(args.corpus)
     print(f"parsed {len(rows)} ranked entries from {args.corpus}")
@@ -275,35 +328,63 @@ def main():
     ).fetchall()
     if args.limit:
         pending = pending[: args.limit]
+    target_ranks = [r["rank"] for r in pending]
+    total = len(target_ranks)
+    print(f"{total} words to process (backend={args.backend}, model={args.model}, workers={args.workers}, think={args.think})")
 
-    total = len(pending)
-    print(f"{total} words to process (model={args.model}, host={args.host}, workers={args.workers})")
-
-    done = mismatches = failed = 0
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {
-            ex.submit(compute_row, args.host, args.model, args.examples, row): row
-            for row in pending
-        }
-        for i, fut in enumerate(as_completed(futures), 1):
-            row = futures[fut]
-            result = fut.result()
-            persist_result(conn, row, result, args.max_attempts)
-            if result["ok"]:
-                done += 1
-                if result["mismatch"]:
-                    mismatches += 1
-                tag = "MISMATCH" if result["mismatch"] else "ok"
-            else:
-                failed += 1
-                tag = f"FAILED ({result['error']})"
-            elapsed = time.time() - t0
-            rate = i / elapsed if elapsed > 0 else 0
-            eta = (total - i) / rate if rate > 0 else float("inf")
-            print(f"[{i}/{total}] rank={row['rank']} {row['word']!r} -> {tag}  (eta {eta/60:.1f}m)", file=sys.stderr)
+    n_done = 0
+    round_num = 0
+    while True:
+        round_num += 1
+        placeholders = ",".join("?" * len(target_ranks))
+        batch = conn.execute(
+            f"SELECT * FROM words WHERE rank IN ({placeholders}) AND status IN ('pending', 'error') "
+            f"AND attempts < ? ORDER BY rank",
+            (*target_ranks, args.max_attempts),
+        ).fetchall()
+        if not batch:
+            break
+        if round_num > 1:
+            print(f"-- retry round {round_num}: {len(batch)} row(s) --", file=sys.stderr)
+            time.sleep(args.retry_backoff)
 
-    print(f"done={done} mismatches={mismatches} failed={failed}")
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = {
+                ex.submit(compute_row, args.backend, args.host, args.model, args.examples, row, args.timeout, args.think): row
+                for row in batch
+            }
+            for fut in as_completed(futures):
+                row = futures[fut]
+                result = fut.result()
+                persist_result(conn, row, result, args.max_attempts)
+                if result["ok"]:
+                    n_done += 1
+                    tag = "MISMATCH" if result["mismatch"] else "ok"
+                else:
+                    attempts = row["attempts"] + 1
+                    will_retry = attempts < args.max_attempts
+                    tag = f"{'ERROR, will retry' if will_retry else 'FAILED'} ({result['error']})"
+                    if not will_retry:
+                        n_done += 1
+                elapsed = time.time() - t0
+                rate = n_done / elapsed if elapsed > 0 else 0
+                eta = (total - n_done) / rate if rate > 0 else float("inf")
+                print(
+                    f"[{n_done}/{total}] rank={row['rank']} {row['word']!r} -> {tag}  (eta {eta/60:.1f}m)",
+                    file=sys.stderr,
+                )
+
+    final = conn.execute(
+        f"SELECT status, count(*) c FROM words WHERE rank IN ({','.join('?' * len(target_ranks))}) GROUP BY status",
+        target_ranks,
+    ).fetchall()
+    mismatches = conn.execute(
+        f"SELECT count(*) FROM words WHERE rank IN ({','.join('?' * len(target_ranks))}) AND reading_mismatch = 1",
+        target_ranks,
+    ).fetchone()[0]
+    summary = {r["status"]: r["c"] for r in final}
+    print(f"summary: {summary} mismatches={mismatches}")
 
 
 if __name__ == "__main__":
