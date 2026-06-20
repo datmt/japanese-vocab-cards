@@ -185,7 +185,7 @@ function shuffle(arr) {
 
 function startQuiz(start, end) {
   const chunkWords = queryAll(
-    'SELECT rank, headword, reading_llm, reading_dict, gloss FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
+    'SELECT rank, headword, reading_llm, reading_dict, gloss, image_path FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
     [start, end]
   );
   const allGlosses = queryAll('SELECT DISTINCT gloss FROM words WHERE gloss IS NOT NULL AND gloss != ""').map(
@@ -216,6 +216,14 @@ function startQuiz(start, end) {
     qEl.className = 'quiz-question';
     qEl.textContent = q.word.headword;
     content.appendChild(qEl);
+
+    if (q.word.image_path) {
+      const img = document.createElement('img');
+      img.className = 'quiz-image';
+      img.src = q.word.image_path;
+      img.alt = '';
+      content.appendChild(img);
+    }
 
     const readingEl = document.createElement('div');
     readingEl.className = 'quiz-reading';
