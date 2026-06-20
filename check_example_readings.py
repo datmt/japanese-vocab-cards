@@ -11,23 +11,23 @@ TTS frontends like misaki/MeCab use). It catches real context errors (e.g.
 heteronyms purely because the dictionary cites a formal/literary reading
 (私→わたくし, 日本→にっぽん, 明日→あす) where the LLM picked the casual one
 that actually fits these example sentences — not every mismatch means the LLM
-is wrong. So this only flags; it does not overwrite `jp_reading`. A human
-reviews flagged rows (surfaced in the UI as a warning badge) and decides
-which reading is right per-sentence.
+is wrong, so those known heteronyms (HETERONYMS below) are excluded from
+"mismatch" entirely. For everything else, the dictionary reading wins: this
+overwrites `jp_reading` (the text the UI displays) with the dictionary
+reading whenever the two disagree.
 
 For every row in `examples`, this:
   - computes the dictionary reading of `jp` via SudachiPy
   - backs up the original LLM reading into `reading_llm` (first run only)
   - stores the dictionary reading in `reading_dict`
-  - flags `reading_mismatch` when they disagree (ignoring whitespace), unless
-    the only difference is one of the known heteronyms in HETERONYMS below
-    (the dictionary only ever returns one of several valid readings for these,
-    so a difference there isn't a sign of an LLM error)
+  - flags `reading_mismatch` (audit trail only) when `jp_reading` disagrees
+    with the dictionary reading (ignoring whitespace), unless the only
+    difference is one of the known heteronyms in HETERONYMS below
+  - on a real mismatch, overwrites `jp_reading` with the dictionary reading
 
-`jp_reading` (the text the UI displays) is left untouched.
-
-Deterministic and idempotent (no LLM, no network), so safe to re-run after
-edits to examples.jp.
+Deterministic and idempotent (no LLM, no network): re-running after the first
+pass is a no-op for already-corrected rows, since `jp_reading` then equals
+the dictionary reading and no longer disagrees with it.
 """
 import itertools
 import sqlite3
@@ -90,18 +90,19 @@ def main():
     n_mismatch = 0
     for row in rows:
         llm_reading = row["reading_llm"] or row["jp_reading"] or ""
+        current_norm = strip_spaces(normalize_reading(row["jp_reading"] or ""))
         dict_val = dict_reading(row["jp"])
-        llm_norm = strip_spaces(normalize_reading(llm_reading))
-        differs = dict_val and llm_norm != strip_spaces(dict_val)
-        mismatch = 1 if differs and not heteronym_match(row["jp"], llm_norm) else 0
+        differs = dict_val and current_norm != strip_spaces(dict_val)
+        mismatch = 1 if differs and not heteronym_match(row["jp"], current_norm) else 0
         if mismatch:
             n_mismatch += 1
         conn.execute(
-            "UPDATE examples SET reading_llm = ?, reading_dict = ?, reading_mismatch = ? WHERE id = ?",
-            (llm_reading, dict_val, mismatch, row["id"]),
+            "UPDATE examples SET reading_llm = ?, reading_dict = ?, reading_mismatch = ?, "
+            "jp_reading = CASE WHEN ? THEN ? ELSE jp_reading END WHERE id = ?",
+            (llm_reading, dict_val, mismatch, mismatch, dict_val, row["id"]),
         )
     conn.commit()
-    print(f"checked {len(rows)} examples, {n_mismatch} mismatch(es) flagged")
+    print(f"checked {len(rows)} examples, {n_mismatch} mismatch(es) corrected to dictionary reading")
 
 
 if __name__ == "__main__":
