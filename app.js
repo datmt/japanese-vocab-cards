@@ -55,7 +55,7 @@ function renderSidebar() {
 function renderChunk(start, end) {
   activeChunk = { start, end };
   const words = queryAll(
-    'SELECT rank, headword, reading_llm, reading_dict, gloss, mnemonic, has_kanji, image_path FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
+    'SELECT rank, headword, reading_llm, reading_dict, gloss, pos, mnemonic, has_kanji, image_path FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
     [start, end]
   );
 
@@ -89,6 +89,7 @@ function renderWordRow(w) {
     <span class="headword">${escapeHtml(w.headword)}</span>
     <span class="reading">${escapeHtml(reading)}</span>
     <span class="gloss">${escapeHtml(w.gloss)}</span>
+    ${w.pos ? `<span class="pos">${escapeHtml(w.pos)}</span>` : ''}
   `;
 
   let detailEl = null;
