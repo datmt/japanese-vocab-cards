@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Japanese Vocab Flashcards</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <nav id="sidebar">
+    <h1>頻度帳</h1>
+    <div id="loading">Loading vocab.db…</div>
+    <ul id="chunk-list"></ul>
+  </nav>
+  <main id="content">
+    <p class="hint">Pick a chunk from the left to start.</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
