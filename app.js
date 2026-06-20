@@ -111,11 +111,14 @@ function renderWordDetail(w) {
   const detail = document.createElement('div');
   detail.className = 'word-detail';
 
+  const body = document.createElement('div');
+  body.className = 'detail-body';
+
   if (w.has_kanji && w.mnemonic) {
     const m = document.createElement('p');
     m.className = 'mnemonic';
     m.textContent = w.mnemonic;
-    detail.appendChild(m);
+    body.appendChild(m);
   }
 
   const examples = queryAll(
@@ -154,8 +157,19 @@ function renderWordDetail(w) {
       exEl.appendChild(breakdownEl);
     }
 
-    detail.appendChild(exEl);
+    body.appendChild(exEl);
   });
+
+  detail.appendChild(body);
+
+  if (w.image_path) {
+    const img = document.createElement('img');
+    img.className = 'detail-image';
+    img.src = w.image_path;
+    img.alt = '';
+    img.loading = 'lazy';
+    detail.appendChild(img);
+  }
 
   return detail;
 }
