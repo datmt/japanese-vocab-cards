@@ -117,7 +117,7 @@ function renderWordDetail(w) {
   }
 
   const examples = queryAll(
-    'SELECT jp, jp_reading, en, audio_path FROM examples WHERE word_rank = ? ORDER BY id',
+    'SELECT id, jp, jp_reading, en, audio_path, grammar_note, reading_mismatch, reading_dict FROM examples WHERE word_rank = ? ORDER BY id',
     [w.rank]
   );
   examples.forEach((ex) => {
@@ -128,7 +128,30 @@ function renderWordDetail(w) {
       <div class="reading">${escapeHtml(ex.jp_reading)}</div>
       <div class="en">${escapeHtml(ex.en)}</div>
       ${ex.audio_path ? `<audio controls src="${escapeHtml(ex.audio_path)}"></audio>` : ''}
+      ${ex.grammar_note ? `<div class="grammar-note">${escapeHtml(ex.grammar_note)}</div>` : ''}
+      ${ex.reading_mismatch ? `<div class="reading-warning" title="Dictionary parser reads this as ${escapeHtml(ex.reading_dict)} — needs human check">⚠ reading needs check (dict: ${escapeHtml(ex.reading_dict)})</div>` : ''}
     `;
+
+    const tokens = queryAll(
+      'SELECT surface, reading, pos, meaning, note FROM example_breakdown WHERE example_id = ? ORDER BY seq',
+      [ex.id]
+    );
+    if (tokens.length) {
+      const breakdownEl = document.createElement('div');
+      breakdownEl.className = 'breakdown';
+      tokens.forEach((t) => {
+        const chip = document.createElement('span');
+        chip.className = 'breakdown-token';
+        chip.innerHTML = `
+          <span class="bt-surface">${escapeHtml(t.surface)}</span>
+          <span class="bt-reading">${escapeHtml(t.reading)}</span>
+          <span class="bt-meaning">${escapeHtml(t.meaning)}${t.pos ? ` <em>(${escapeHtml(t.pos)})</em>` : ''}${t.note ? `<br>${escapeHtml(t.note)}` : ''}</span>
+        `;
+        breakdownEl.appendChild(chip);
+      });
+      exEl.appendChild(breakdownEl);
+    }
+
     detail.appendChild(exEl);
   });
 

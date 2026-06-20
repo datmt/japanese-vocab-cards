@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Turn each word's kanji mnemonic into a clean txt2img scene prompt.
+"""Generate a txt2img scene prompt depicting each word's meaning.
 
-Mnemonics are written as instructions to a learner ("Imagine...",
-"Visualize yourself...") and often ask the reader to picture the kanji
-itself. Diffusion models render that literally (producing garbled text)
-and follow the meta-phrasing instead of just depicting the scene. This
-script calls an LLM to rewrite each mnemonic into a plain scene
-description with no meta phrasing and no instruction to draw the kanji
-glyph (the glyph gets composited on top of the generated image later,
-as text, not by the diffusion model).
+Only content words (n./v./i-adj./na-adj.) get a prompt — particles,
+aux, conj, pronouns, interjections, etc. have no concrete visual
+meaning. The prompt depicts the word's gloss, not the kanji mnemonic
+(mnemonics describe how to remember the kanji shape, not the word's
+meaning, and produce confusing/irrelevant scenes when illustrated).
 
 Resumable: progress tracked per-row in `words.image_prompt_status`,
 same pattern as build_db.py's `status` column.
 """
 import argparse
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -26,23 +24,36 @@ from build_db import OPENROUTER_URL
 
 MAX_ATTEMPTS_DEFAULT = 3
 
-PROMPT_TEMPLATE = """You write prompts for a text-to-image diffusion model. Convert the kanji mnemonic below into a short, vivid txt2img scene prompt.
+# Content-bearing POS tokens — only words tagged with one of these have a
+# concrete, illustratable meaning. Pure particles/aux/conj/pron/interj/
+# num/adn/cp/suffix/prefix/adv words are excluded (e.g. の/は/た/が/って,
+# "TOPIC"/"PAST"-style grammar glosses with no depictable scene).
+CONTENT_POS_TOKENS = {"n.", "v.", "na-adj.", "i-adj.", "adj.", "n"}
+
+
+def is_content_pos(pos):
+    if not pos:
+        return False
+    tokens = re.split(r"[\s,]+", pos.strip())
+    return any(t in CONTENT_POS_TOKENS for t in tokens)
+
+PROMPT_TEMPLATE = """You write prompts for a text-to-image diffusion model. Write a short, vivid txt2img scene prompt that depicts the MEANING of the word below — a scene a learner would associate with this word's meaning.
 
 Rules:
 - Output ONLY the image prompt, no commentary, no markdown, no quotes.
-- Describe the scene directly (e.g. "a heart resting on a rice field at sunset"), never instructions to a reader ("imagine", "visualize", "picture yourself").
-- Never ask for any kanji, kana, or text to be drawn/rendered in the image — the model can't render CJK text reliably. Describe only the visual metaphor/components (e.g. "a heart shape" not "the kanji 心").
+- Describe the scene directly (e.g. "a steaming bowl of rice on a wooden table"), never instructions to a reader ("imagine", "visualize", "picture yourself").
+- Never ask for any kanji, kana, or text to be drawn/rendered in the image — the model can't render CJK text reliably.
 - Keep it concrete and illustratable: objects, composition, setting, mood, art style (e.g. "flat minimalist illustration", "soft pastel colors").
 - One sentence, under 40 words.
 
 Word: {word}
-Mnemonic: {mnemonic}
+Meaning: {gloss}
 
 Image prompt:"""
 
 
-def build_prompt(word, mnemonic):
-    return PROMPT_TEMPLATE.format(word=word, mnemonic=mnemonic)
+def build_prompt(word, gloss):
+    return PROMPT_TEMPLATE.format(word=word, gloss=gloss)
 
 
 def call_ollama_text(host, model, prompt, timeout=300, think=False):
@@ -105,7 +116,7 @@ def ensure_columns(conn):
 def compute_row(backend, host, model, row, timeout=300, think=False):
     """Network work only, no DB access — safe to run from worker threads."""
     rank = row["rank"]
-    prompt = build_prompt(row["word"], row["mnemonic"])
+    prompt = build_prompt(row["word"], row["gloss"])
     try:
         content = call_llm_text(backend, host, model, prompt, timeout=timeout, think=think)
         text = content.strip().strip('"')
@@ -157,9 +168,14 @@ def main():
     conn.row_factory = sqlite3.Row
     ensure_columns(conn)
 
+    all_rows = conn.execute("SELECT * FROM words ORDER BY rank").fetchall()
+    content_ranks = [r["rank"] for r in all_rows if is_content_pos(r["pos"])]
+    placeholders = ",".join("?" * len(content_ranks))
+
     pending = conn.execute(
-        "SELECT * FROM words WHERE has_kanji = 1 AND mnemonic IS NOT NULL "
-        "AND image_prompt_status IN ('pending', 'error') ORDER BY rank"
+        f"SELECT * FROM words WHERE rank IN ({placeholders}) "
+        f"AND image_prompt_status IN ('pending', 'error') ORDER BY rank",
+        content_ranks,
     ).fetchall()
     if args.limit:
         pending = pending[: args.limit]
