@@ -209,22 +209,77 @@ reliably would need per-mora energy/duration analysis (forced alignment)
 against reference recordings, not implemented. Logged as a known gap, not
 queued for a fix.
 
+## Word-targeted check: built, results
+
+`check_word_readings.py` implements the plan above. For each example, it
+finds the `example_breakdown` row matching the headword (direct surface
+match, then SudachiPy `dictionary_form()` — re-tokenized with one neighbor
+surface of local context on each side, since tokenizing a bare inflected
+fragment like "あり" in isolation mis-parses as the noun "ant" instead of a
+stem of "ある"; `Morpheme.begin()/end()` offsets pick out only the morpheme
+overlapping the row's own span). Corpus headwords for suru-verbs carry a
+literal `（する）` suffix (e.g. `仕事（する）`) that never appears in text —
+stripped before matching.
+
+Critical addition found in practice: `example_breakdown.reading` is itself
+LLM-generated and not always right — e.g. headword 実 broken down with
+reading み while the curated `jp_reading` for that exact sentence says じつ;
+or 三つ broken down as さんつ (not even valid kana) against `jp_reading`'s
+みっつ. Trusting the breakdown reading blindly produced ~370 false "TTS
+mismatch" flags that were actually breakdown-data errors, nothing to do with
+audio. Fix: only treat the breakdown reading as ground truth if it's itself
+a substring of `jp_reading` (normalized); otherwise the row is marked
+`word_check_status = 'breakdown_conflict'`, tracked separately, not counted
+as a mismatch.
+
+Final pass over all 10000 examples (after the false-positive fix and after
+resynthesizing the genuine misreads found along the way):
+
+| `word_check_status` | count | meaning |
+|---|---|---|
+| `done`, match | 8537 | word-level reading confirmed in STT |
+| `no_match` | 1083 | headword not found anywhere in the breakdown — pre-existing example-generation bug (sentence doesn't actually contain the headword, or only a compound containing its kanji), out of scope for audio QC |
+| `breakdown_conflict` | 374 | breakdown's own reading disagrees with `jp_reading` — a breakdown-data bug, not an audio bug |
+| `word_mismatch` | 6 | confirmed real TTS misreads that survived a resynth attempt (see below) |
+
+This directly fixed the motivating case: word_rank=1108 (伯父), examples
+id=2211/2212, TTS said はくじ instead of おじ. Whole-sentence `stt_similarity`
+for both was 0.93 — above the 0.85 threshold, so `check_audio_readings.py`
+never flagged it; the word-targeted check did. 132 other genuine homograph
+misreads surfaced the same way across the corpus, all fixed by
+resynthesizing from `jp_reading` instead of `jp` (see `--force-reading`
+below) — and as a side effect this also dropped the whole-sentence
+`stt_mismatch` count from 129 to 95.
+
+### Fix path: `resolve_audio_mismatches.py --force-reading`
+
+Added a third resynthesis cause to `resolve_audio_mismatches.py`: homograph
+G2P misread, where the engine's own grapheme-to-phoneme step picks a
+different (often equally "valid") reading than the curated one for a given
+kanji. Unlike the runaway/digit causes already handled, this is the
+engine's *default* choice, not a transient glitch — a plain retry on `jp`
+reliably reproduces the same wrong reading. `--force-reading` always
+synthesizes from `jp_reading` (already pure kana, unambiguous) instead of
+`jp` for the whole `--ids-file` batch. Fixed 132/138 of the cases it was
+tried against.
+
+## Known unfixed flaw: TTS overrides literal kana input for some words
+
+The remaining 6 `word_mismatch` rows (私→わたくし, 日本→にっぽん ×2,
+明日→あす, 体育→たいゆく, 国境→こきょう) did **not** get fixed by
+`--force-reading`, even though the synthesis input was already pure kana
+with the intended reading spelled out literally (e.g. `わたしは がくせい
+です。`). STT still heard わたくし. This means the TTS engine isn't just
+doing grapheme-to-phoneme inference on ambiguous kanji — it's substituting
+its own preferred reading for certain words even when given an unambiguous
+kana string, presumably a formality/style normalization step inside the
+engine itself. Forcing the input text further (e.g. inserting pauses,
+breaking the word into separate segments) wasn't tried. Logged as a known
+gap, not queued for a fix — would need experimentation with a different
+voice/model or an engine-level setting to suppress text normalization.
+
 ## TODO
 
-- **HIGH PRIORITY — pick up here next session:** build the word-targeted
-  check described above once both background jobs below have more
-  coverage (or are done):
-  - `check_audio_readings.py --workers 4` (PID may differ next session) —
-    sentence-level STT check, was at 5556/10000 done as of last check.
-  - `generate_breakdown.py --workers 1` — was at 5179/10000 done (+3
-    error) as of last check; needed for `example_breakdown` coverage.
-  - Both are detached (`nohup ... & disown`), survive across sessions on
-    their own — just re-check `pgrep -af check_audio_readings` /
-    `pgrep -af generate_breakdown.py` and the `*_status` column counts in
-    `vocab.db` to see where they left off.
-  - Once `check_audio_readings.py` finishes, also pull the full
-    `stt_mismatch = 1` list for manual review before building anything
-    further on top of it.
 - Run both biased and unbiased transcription per clip, derive a reading from
   each, and take `max(sim_biased, sim_unbiased)` as the final score — only
   flag a clip if *neither* pass reproduces the target reading. Fixes the

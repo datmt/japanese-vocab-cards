@@ -106,7 +106,7 @@ def main():
     total = len(pending)
     print(f"{total} example(s) to word-check")
 
-    n_done = n_no_match = n_mismatch = 0
+    n_done = n_no_match = n_mismatch = n_conflict = 0
     for i, row in enumerate(pending, 1):
         breakdown_rows = conn.execute(
             "SELECT * FROM example_breakdown WHERE example_id = ? ORDER BY seq", (row["id"],)
@@ -120,23 +120,38 @@ def main():
             n_no_match += 1
         else:
             target = match["reading"]
-            stt_match = norm_for_compare(target) in norm_for_compare(row["stt_reading"])
-            conn.execute(
-                "UPDATE examples SET word_target_reading = ?, word_stt_match = ?, "
-                "word_check_status = 'done', word_check_note = NULL WHERE id = ?",
-                (target, int(stt_match), row["id"]),
-            )
-            n_done += 1
-            if not stt_match:
-                n_mismatch += 1
-                print(f"id={row['id']} word_rank={row['word_rank']} headword={row['headword']} "
-                      f"target={target!r} stt_reading={row['stt_reading']!r} -> MISMATCH")
+            # example_breakdown.reading is itself LLM-generated and not always
+            # right (e.g. headword 実 broken down with reading 'み' while the
+            # curated jp_reading for that exact sentence says 'じつ') —
+            # trusting it blindly produces false TTS-mismatch flags that are
+            # really breakdown-data errors. Only treat it as ground truth if
+            # it's consistent with jp_reading, the value actually used to
+            # judge the audio everywhere else.
+            if norm_for_compare(target) not in norm_for_compare(row["jp_reading"]):
+                conn.execute(
+                    "UPDATE examples SET word_target_reading = ?, word_check_status = 'breakdown_conflict', "
+                    "word_check_note = ? WHERE id = ?",
+                    (target, f"breakdown reading {target!r} not found in jp_reading {row['jp_reading']!r}", row["id"]),
+                )
+                n_conflict += 1
+            else:
+                stt_match = norm_for_compare(target) in norm_for_compare(row["stt_reading"])
+                conn.execute(
+                    "UPDATE examples SET word_target_reading = ?, word_stt_match = ?, "
+                    "word_check_status = 'done', word_check_note = NULL WHERE id = ?",
+                    (target, int(stt_match), row["id"]),
+                )
+                n_done += 1
+                if not stt_match:
+                    n_mismatch += 1
+                    print(f"id={row['id']} word_rank={row['word_rank']} headword={row['headword']} "
+                          f"target={target!r} stt_reading={row['stt_reading']!r} -> MISMATCH")
         if i % 500 == 0:
             conn.commit()
             print(f"[{i}/{total}]")
 
     conn.commit()
-    print(f"summary: done={n_done} no_match={n_no_match} word_mismatch={n_mismatch}")
+    print(f"summary: done={n_done} no_match={n_no_match} breakdown_conflict={n_conflict} word_mismatch={n_mismatch}")
 
 
 if __name__ == "__main__":
