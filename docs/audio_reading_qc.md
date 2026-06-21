@@ -98,6 +98,124 @@ still need to derive a reading from whatever mixed kanji/kana text comes
 back, and with punctuation now reliably preserved, that derivation is no
 longer artifact-prone the way it was without the bias prompt.
 
+## Second fix: strip punctuation before comparing
+
+Even with the bias prompt, a remaining class of false positive showed up:
+Whisper's punctuation-*glyph* choice doesn't always match the corpus text's,
+even when the actual words/reading are identical. id=80:
+
+```
+jp_reading:  なんですか。   (corpus uses a full stop)
+stt_reading: なんですか?   (Whisper guessed a question mark — reasonable, it is a question)
+```
+
+Same reading, same pronunciation — but on an 8-character string, one glyph
+difference dropped the ratio to 0.83, into flagged territory. TTS doesn't
+speak punctuation, so it shouldn't count against a reading match. Fix:
+strip `。、！？!?,.` and whitespace from both sides before computing the
+similarity ratio (the unstripped values are still stored in `stt_reading`/
+`jp_reading` for the audit trail — only the comparison strips them).
+
+## Third fix: normalize chōonpu notation before comparing
+
+Same family of bug, different glyph: Whisper sometimes writes a long vowel
+as a doubled vowel kana instead of the chōonpu mark ー — same sound, two
+spellings. id=243:
+
+```
+jp_reading:  おー、すごい！
+stt_reading: おお、すごい。
+```
+
+After punctuation-stripping, `おーすごい` vs `おおすごい` still differ by one
+char (sim 0.8, flagged). Fix: expand `ー` to the vowel of the preceding kana
+on both sides before comparing (`expand_chōonpu()`), so おー and おお both
+normalize to おお. Verified id=243 now scores 1.0.
+
+## Known unfixed flaw: kana-bias can break jukujikun readings
+
+id=107 (何時ですか / いつですか — 何時 is jukujikun, idiomatic, not built
+from each character's own on/kun-yomi):
+
+```
+unbiased STT: 何時ですか?    (kept kanji intact)
+biased STT:   なにじですか。  (sounded out 何=なに, 時=じ — wrong, audio is fine)
+```
+
+Listened to the clip directly — TTS said いつ correctly. The bias prompt's
+push toward "spell everything phonetically" makes Whisper guess a
+regularized character-by-character reading for this jukujikun instead of
+transcribing what it actually heard. Note the unbiased pass got this one
+right (`dict_reading("何時ですか?")` correctly resolves to いつですか via
+SudachiPy's jukujikun dictionary entry, since the kanji form survived) —
+opposite of the punctuation case, where biased was the fix and unbiased was
+broken. Neither pass alone is reliably correct across both failure modes.
+
+## Known unfixed flaw: whole-sentence fuzzy ratio dilutes short word-level errors
+
+word_rank=1108 (伯父, correct reading おじ): TTS pronounced it はくじ — not
+おじ, not even the formal alt はくふ, just wrong. The biased STT transcript
+correctly heard はくじ (STT is not at fault here). But the example sentences
+are long (20+ chars), so 3 wrong characters barely move the whole-string
+fuzzy ratio: id=2211 scored 0.93, id=2212 scored 0.94 — both well above the
+0.85 threshold, so this real, confirmed TTS error was never flagged. This is
+the length-dilution problem named as a caveat from the start, now confirmed
+with a real case, not hypothetical.
+
+Fix direction (discussed, not yet built): a second, word-targeted script
+that doesn't rely on whole-sentence similarity at all. `example_breakdown`
+(populated by `generate_breakdown.py`) already has a per-token `reading`
+column, context-resolved per sentence (e.g. id=2211 seq=0: surface=伯父,
+reading=おじ) — no need to re-tokenize `jp` ourselves or do offset math.
+Plan:
+- For each example, find its `example_breakdown` row matching the headword
+  (match by surface for nouns; for inflecting words like verbs, map via
+  SudachiPy `dictionary_form()` on the breakdown row's surface, e.g.
+  引っ越して → 引っ越す, to match `words.headword`).
+  Note: ground truth must come from `examples.jp_reading`/`example_breakdown`
+  (per-sentence, context-correct), **not** a fixed `words.reading_llm`
+  lookup — a word can legitimately have different valid readings in
+  different sentences (heteronyms), so a per-word fixed reading would
+  itself generate false positives.
+- Take that breakdown row's `reading` as the localized ground truth.
+- Check it survives as a substring in the already-collected `stt_reading`
+  for that row (reuse `check_audio_readings.py`'s existing data, no new STT
+  calls needed) — localized, not diluted by sentence length.
+- Coverage caveat: `example_breakdown` is only populated where
+  `breakdown_status = 'done'` — at last check 5179/10000 done, 3 errored,
+  4818 still pending (`generate_breakdown.py --workers 1` running). The
+  word-targeted check can only cover rows with breakdown done.
+
+## TODO
+
+- **HIGH PRIORITY — pick up here next session:** build the word-targeted
+  check described above once both background jobs below have more
+  coverage (or are done):
+  - `check_audio_readings.py --workers 4` (PID may differ next session) —
+    sentence-level STT check, was at 5556/10000 done as of last check.
+  - `generate_breakdown.py --workers 1` — was at 5179/10000 done (+3
+    error) as of last check; needed for `example_breakdown` coverage.
+  - Both are detached (`nohup ... & disown`), survive across sessions on
+    their own — just re-check `pgrep -af check_audio_readings` /
+    `pgrep -af generate_breakdown.py` and the `*_status` column counts in
+    `vocab.db` to see where they left off.
+  - Once `check_audio_readings.py` finishes, also pull the full
+    `stt_mismatch = 1` list for manual review before building anything
+    further on top of it.
+- Run both biased and unbiased transcription per clip, derive a reading from
+  each, and take `max(sim_biased, sim_unbiased)` as the final score — only
+  flag a clip if *neither* pass reproduces the target reading. Fixes the
+  jukujikun case (id=107) without reintroducing the punctuation/segmentation
+  bug (the first fix) that the unbiased-only approach had. Costs 2x the STT
+  calls per clip (run time roughly doubles). Not implemented yet — do this
+  before trusting the flagged list for jukujikun-heavy vocabulary.
+- After this full pass settles, re-run `check_audio_readings.py` scoped to
+  `stt_mismatch = 1` one more time (e.g. add a `--recheck` flag, or just
+  re-flip those rows to `stt_check_status = 'pending'`) to confirm flags
+  hold up to a second independent STT pass before treating the flagged list
+  as final — Whisper's own non-determinism (or the dual-pass fix above)
+  could still clear some of them.
+
 ## Caveats / known limitations
 
 - STT has its own noise independent of this fix: vowel-length notation

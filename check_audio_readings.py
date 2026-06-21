@@ -19,17 +19,53 @@ per-row enrichment scripts.
 """
 import argparse
 import difflib
+import re
 import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from num2words import num2words
 
 from build_db import dict_reading, normalize_reading
 
 MAX_ATTEMPTS_DEFAULT = 3
 DEFAULT_SIMILARITY_THRESHOLD = 0.85
+
+# TTS doesn't speak punctuation, so a punctuation-glyph difference between
+# Whisper's guess (e.g. "?") and the corpus text's choice (e.g. "。") isn't a
+# pronunciation error — but on short sentences one stray glyph can tank the
+# fuzzy-match ratio enough to false-flag a perfectly-read clip (see id=80:
+# "なんですか。" vs "なんですか?" scored 0.83 despite identical pronunciation).
+# Strip before comparing.
+PUNCT_RE = re.compile(r"[。、！？!?,.\s]")
+
+# Whisper sometimes transliterates a long vowel as a doubled vowel kana
+# instead of the chōonpu mark ー (おー vs おお — same sound, see id=243).
+# Expand ー to the vowel of the preceding kana on both sides before
+# comparing, so notation choice doesn't count as a reading mismatch.
+_VOWEL_GROUPS = {
+    "a": "あかさたなはまやらわがざだばぱゃぁ",
+    "i": "いきしちにひみりぎじぢびぴぃ",
+    "u": "うくすつぬふむゆるぐずづぶぷゅぅ",
+    "e": "えけせてねへめれげぜでべぺぇ",
+    "o": "おこそとのほもよろごぞどぼぽょぉ",
+}
+VOWEL_OF = {ch: vowel for vowel, chars in _VOWEL_GROUPS.items() for ch in chars}
+VOWEL_CHAR = {"a": "あ", "i": "い", "u": "う", "e": "え", "o": "お"}
+
+
+def expand_chōonpu(s):
+    out = []
+    last_vowel = None
+    for ch in s:
+        if ch == "ー" and last_vowel:
+            out.append(VOWEL_CHAR[last_vowel])
+        else:
+            out.append(ch)
+            last_vowel = VOWEL_OF.get(ch, last_vowel)
+    return "".join(out)
 
 # Seeds Whisper's decoder context toward an all-hiragana style. Without this,
 # Whisper defaults to standard kanji orthography, and re-deriving a reading
@@ -41,6 +77,23 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.85
 # spoken reading) or at least preserves punctuation well enough that
 # dict_reading() segments correctly.
 KANA_BIAS_PROMPT = "ええ、あの、これはぜんぶひらがなでかいたぶんしょうです。かんじはつかいません。"
+
+# Whisper renders spoken numbers as arabic digits in its transcript (e.g. a
+# correctly-spoken "さんじゅうだい" comes back as "30代"), but SudachiPy's
+# reading_form() has no notion of multi-digit numerals — it reads each digit
+# character separately ("30" -> さんれい, digit-by-digit) rather than as a
+# number. That alone accounts for most false-positive mismatches on sentences
+# with numbers. Convert digit runs to kanji numerals first so dict_reading()
+# gets text it actually knows how to read.
+DIGIT_RUN_RE = re.compile(r"\d[\d,]*\d|\d")
+
+
+def normalize_arabic_numerals(text):
+    def replace(m):
+        n = int(m.group(0).replace(",", ""))
+        return num2words(n, lang="ja")
+
+    return DIGIT_RUN_RE.sub(replace, text)
 
 
 def ensure_columns(conn):
@@ -62,20 +115,39 @@ def ensure_columns(conn):
     conn.commit()
 
 
-def call_whisper(host, audio_path, timeout=120):
-    """POST the clip to the gb10 whisper server, return its raw text transcript."""
+# initial_prompt biasing occasionally sends Whisper into a degenerate loop
+# where it echoes the prompt itself instead of transcribing the clip (e.g.
+# the audio for "家族のために働きます" came back as "かんじはつかいません。"
+# repeated 30+ times — that's a chunk of KANA_BIAS_PROMPT, not the sentence).
+# Detect a short run repeating 3+ times and treat it as a transcription
+# failure for that attempt, not a real reading.
+LOOP_RE = re.compile(r"(.{2,20}?)\1{2,}")
+
+
+def _raw_whisper(host, audio_path, initial_prompt, timeout):
     with open(audio_path, "rb") as f:
+        data = {"language": "ja", "task": "transcribe", "response_format": "verbose_json"}
+        if initial_prompt:
+            data["initial_prompt"] = initial_prompt
         resp = requests.post(
             f"{host}/transcribe",
             files={"file": (audio_path, f, "audio/wav")},
-            data={
-                "language": "ja", "task": "transcribe",
-                "initial_prompt": KANA_BIAS_PROMPT, "response_format": "verbose_json",
-            },
+            data=data,
             timeout=timeout,
         )
     resp.raise_for_status()
     return resp.json()["text"]
+
+
+def call_whisper(host, audio_path, timeout=120):
+    """POST the clip to the gb10 whisper server, return its raw text transcript.
+
+    Falls back to an unbiased call if the kana-biased one degenerates into a
+    repetition loop (see LOOP_RE above)."""
+    text = _raw_whisper(host, audio_path, KANA_BIAS_PROMPT, timeout=timeout)
+    if LOOP_RE.search(text):
+        text = _raw_whisper(host, audio_path, None, timeout=timeout)
+    return text
 
 
 def compute_row(host, row, threshold, timeout=120):
@@ -85,9 +157,11 @@ def compute_row(host, row, threshold, timeout=120):
         transcript = call_whisper(host, row["audio_path"], timeout=timeout)
         if not transcript or not transcript.strip():
             raise ValueError("empty transcript")
-        stt_reading = dict_reading(transcript)
+        stt_reading = dict_reading(normalize_arabic_numerals(transcript))
         target_reading = normalize_reading(row["jp_reading"] or "")
-        sim = difflib.SequenceMatcher(None, stt_reading, target_reading).ratio()
+        a = expand_chōonpu(PUNCT_RE.sub("", stt_reading))
+        b = expand_chōonpu(PUNCT_RE.sub("", target_reading))
+        sim = difflib.SequenceMatcher(None, a, b).ratio()
         return {
             "id": row_id,
             "ok": True,
