@@ -13,6 +13,13 @@ jp_reading. Two root causes account for most flags:
     has the correct spoken-form kana for the whole sentence. Synthesizing
     from `jp_reading` instead of `jp` sidesteps the engine's lack of
     number normalization.
+  - Homograph G2P misread (e.g. 伯父 -> はくじ instead of おじ): the
+    engine's own grapheme-to-phoneme step picks a reading other than the
+    curated one. Unlike the runaway/digit cases this is the engine's
+    default choice, not a transient glitch, so a plain retry on `jp` tends
+    to reproduce the same wrong reading. `--force-reading` always
+    synthesizes from `jp_reading` (kana, unambiguous) instead of `jp` for
+    the whole batch, for exactly this cause.
 
 This only touches rows whose id is listed in --ids-file (one id per line)
 so it can be scoped to a specific batch of flagged mismatches rather than
@@ -37,12 +44,12 @@ def load_ids(path):
         return [int(line.strip()) for line in f if line.strip()]
 
 
-def compute_row(host, voice, speed, audio_dir, row, timeout=120):
+def compute_row(host, voice, speed, audio_dir, row, force_reading, timeout=120):
     """Network work + unique-file write only, no sqlite access — safe from worker threads."""
     row_id = row["id"]
     try:
         has_digit = any(c.isdigit() for c in row["jp"])
-        text = (row["jp_reading"] if has_digit else row["jp"]).strip()
+        text = (row["jp_reading"] if (has_digit or force_reading) else row["jp"]).strip()
         if not text:
             raise ValueError("empty synthesis text")
         audio = call_qwen_tts(host, voice, text, speed=speed, timeout=timeout)
@@ -51,7 +58,7 @@ def compute_row(host, voice, speed, audio_dir, row, timeout=120):
         path = os.path.join(audio_dir, f"{row['word_rank']:04d}_{row_id}.mp3")
         with open(path, "wb") as f:
             f.write(audio)
-        return {"id": row_id, "ok": True, "audio_path": path, "source": "jp_reading" if has_digit else "jp"}
+        return {"id": row_id, "ok": True, "audio_path": path, "source": "jp_reading" if (has_digit or force_reading) else "jp"}
     except Exception as e:
         return {"id": row_id, "ok": False, "error": str(e)[:500]}
 
@@ -65,7 +72,9 @@ def persist_result(conn, row, result, max_attempts):
             UPDATE examples SET
                 audio_path = ?, audio_status = 'done', audio_error = NULL,
                 stt_check_status = 'pending', stt_check_attempts = 0, stt_check_error = NULL,
-                stt_transcript = NULL, stt_reading = NULL, stt_similarity = NULL, stt_mismatch = 0
+                stt_transcript = NULL, stt_reading = NULL, stt_similarity = NULL, stt_mismatch = 0,
+                word_check_status = 'pending', word_target_reading = NULL, word_stt_match = NULL,
+                word_check_note = NULL
             WHERE id = ?
             """,
             (result["audio_path"], row_id),
@@ -88,6 +97,10 @@ def main():
     ap.add_argument("--voice", default="ja_female_sora")
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--audio-dir", default="audio")
+    ap.add_argument(
+        "--force-reading", action="store_true",
+        help="always synthesize from jp_reading instead of jp (for homograph G2P misreads)",
+    )
     ap.add_argument("--max-attempts", type=int, default=3)
     ap.add_argument("--workers", type=int, default=1, help="parallel TTS requests in flight")
     ap.add_argument("--timeout", type=int, default=120, help="per-request timeout in seconds")
@@ -126,7 +139,7 @@ def main():
 
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = {
-                ex.submit(compute_row, args.host, args.voice, args.speed, args.audio_dir, row, args.timeout): row
+                ex.submit(compute_row, args.host, args.voice, args.speed, args.audio_dir, row, args.force_reading, args.timeout): row
                 for row in batch
             }
             for fut in as_completed(futures):
