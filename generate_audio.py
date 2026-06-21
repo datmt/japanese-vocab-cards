@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate TTS audio (Japanese only) for each example sentence via Kokoro.
+"""Generate TTS audio (Japanese only) for each example sentence via Qwen3-TTS.
 
-Calls the Kokoro TTS server's OpenAI-compatible /v1/audio/speech endpoint
-for every row in `examples`, saving each clip to audio/{word_rank:04d}_{id}.mp3
-and recording the path in examples.audio_path.
+Calls the Qwen3-TTS server's /speak endpoint for every row in `examples`,
+saving each clip to audio/{word_rank:04d}_{id}.mp3 and recording the path
+in examples.audio_path.
 
 Resumable: progress tracked per-row in `examples.audio_status`, same
 pattern as build_db.py's `status` column.
@@ -33,17 +33,15 @@ def ensure_columns(conn):
     conn.commit()
 
 
-def call_kokoro(host, voice, text, speed=0.85, timeout=120):
+def call_qwen_tts(host, voice, text, speed=1.0, timeout=120):
     resp = requests.post(
-        f"{host}/v1/audio/speech",
+        f"{host}/speak",
         json={
-            "model": "kokoro",
-            "input": text,
-            "voice": voice,
-            "response_format": "mp3",
+            "text": text,
+            "language": "Japanese",
+            "voice_id": voice,
             "speed": speed,
-            "lang_code": "ja",
-            "stream": False,
+            "format": "mp3",
         },
         timeout=timeout,
     )
@@ -58,7 +56,7 @@ def compute_row(host, voice, speed, audio_dir, row, timeout=120):
         text = row["jp"].strip()
         if not text:
             raise ValueError("empty jp text")
-        audio = call_kokoro(host, voice, text, speed=speed, timeout=timeout)
+        audio = call_qwen_tts(host, voice, text, speed=speed, timeout=timeout)
         if not audio:
             raise ValueError("empty audio response")
         path = os.path.join(audio_dir, f"{row['word_rank']:04d}_{row_id}.mp3")
@@ -88,11 +86,11 @@ def persist_result(conn, row, result, max_attempts):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate TTS audio for example sentences via Kokoro.")
+    ap = argparse.ArgumentParser(description="Generate TTS audio for example sentences via Qwen3-TTS.")
     ap.add_argument("--db", default="vocab.db")
-    ap.add_argument("--host", default="http://gb10-001:8880", help="Kokoro server host")
-    ap.add_argument("--voice", default="jf_alpha")
-    ap.add_argument("--speed", type=float, default=0.85)
+    ap.add_argument("--host", default="http://gb10-001:8886", help="Qwen3-TTS server host")
+    ap.add_argument("--voice", default="ja_female_sora")
+    ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--audio-dir", default="audio")
     ap.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS_DEFAULT)
     ap.add_argument("--limit", type=int, default=None, help="only process N rows (testing)")
