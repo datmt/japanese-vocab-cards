@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--model", default=None, help="defaults to qwen/qwen3.6-35b-a3b (openrouter) or qwen3.6:35b-a3b (ollama)")
     ap.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS_DEFAULT)
     ap.add_argument("--limit", type=int, default=None, help="only process N rows (testing)")
+    ap.add_argument("--min-id", type=int, default=None, help="only process examples.id >= this (for splitting work across two concurrent runs)")
+    ap.add_argument("--max-id", type=int, default=None, help="only process examples.id <= this (for splitting work across two concurrent runs)")
     ap.add_argument("--workers", type=int, default=1, help="parallel LLM requests in flight")
     ap.add_argument("--timeout", type=int, default=300, help="per-request LLM timeout in seconds")
     ap.add_argument("--retry-backoff", type=float, default=3.0, help="seconds to wait before retrying errored rows")
@@ -131,8 +133,16 @@ def main():
     conn.row_factory = sqlite3.Row
     ensure_columns(conn)
 
+    clauses = ["breakdown_status IN ('pending', 'error')"]
+    params = []
+    if args.min_id is not None:
+        clauses.append("id >= ?")
+        params.append(args.min_id)
+    if args.max_id is not None:
+        clauses.append("id <= ?")
+        params.append(args.max_id)
     pending = conn.execute(
-        "SELECT * FROM examples WHERE breakdown_status IN ('pending', 'error') ORDER BY id"
+        f"SELECT * FROM examples WHERE {' AND '.join(clauses)} ORDER BY id", params
     ).fetchall()
     if args.limit:
         pending = pending[: args.limit]

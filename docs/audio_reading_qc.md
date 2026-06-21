@@ -186,6 +186,29 @@ Plan:
   4818 still pending (`generate_breakdown.py --workers 1` running). The
   word-targeted check can only cover rows with breakdown done.
 
+## Known unfixed flaw: weak/slurred mora invisible to STT-based QC
+
+id=165 (後で連絡します。/ あとでれんらくします。): human listening flags the
+final く in らく as barely audible/slurred. Confirmed independently with two
+other TTS engines (Gemini TTS, ElevenLabs) producing the same weak く —
+not a Qwen3-TTS-specific bug.
+
+`check_audio_readings.py` does not catch this: both biased and unbiased
+Whisper passes transcribe it as れんらく/連絡 with sim=1.0 — ASR's language
+model fills in the expected word from context even when the acoustic signal
+for one mora is weak, so a correct-reading transcript is not proof the audio
+was clearly articulated. `ffmpeg silencedetect` also didn't cleanly confirm
+it (no full silence on the mora, consistent with "weak" rather than
+"dropped" — and a kana-input regeneration test showed a similarly-placed gap,
+inconclusive either way).
+
+This class of defect — under-articulation/weak phonemes that STT
+reconstructs from context rather than truly hearing — is structurally
+outside what a reading-comparison QC script can catch. Detecting it
+reliably would need per-mora energy/duration analysis (forced alignment)
+against reference recordings, not implemented. Logged as a known gap, not
+queued for a fix.
+
 ## TODO
 
 - **HIGH PRIORITY — pick up here next session:** build the word-targeted
