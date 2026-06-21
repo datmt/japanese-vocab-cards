@@ -115,15 +115,6 @@ def ensure_columns(conn):
     conn.commit()
 
 
-# initial_prompt biasing occasionally sends Whisper into a degenerate loop
-# where it echoes the prompt itself instead of transcribing the clip (e.g.
-# the audio for "家族のために働きます" came back as "かんじはつかいません。"
-# repeated 30+ times — that's a chunk of KANA_BIAS_PROMPT, not the sentence).
-# Detect a short run repeating 3+ times and treat it as a transcription
-# failure for that attempt, not a real reading.
-LOOP_RE = re.compile(r"(.{2,20}?)\1{2,}")
-
-
 def _raw_whisper(host, audio_path, initial_prompt, timeout):
     with open(audio_path, "rb") as f:
         data = {"language": "ja", "task": "transcribe", "response_format": "verbose_json"}
@@ -139,36 +130,49 @@ def _raw_whisper(host, audio_path, initial_prompt, timeout):
     return resp.json()["text"]
 
 
-def call_whisper(host, audio_path, timeout=120):
-    """POST the clip to the gb10 whisper server, return its raw text transcript.
-
-    Falls back to an unbiased call if the kana-biased one degenerates into a
-    repetition loop (see LOOP_RE above)."""
-    text = _raw_whisper(host, audio_path, KANA_BIAS_PROMPT, timeout=timeout)
-    if LOOP_RE.search(text):
-        text = _raw_whisper(host, audio_path, None, timeout=timeout)
-    return text
+def _score(transcript, target_reading):
+    reading = dict_reading(normalize_arabic_numerals(transcript))
+    a = expand_chōonpu(PUNCT_RE.sub("", reading))
+    b = expand_chōonpu(PUNCT_RE.sub("", target_reading))
+    return reading, difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def compute_row(host, row, threshold, timeout=120):
-    """Network/CPU work only, no DB access — safe to run from worker threads."""
+    """Network/CPU work only, no DB access — safe to run from worker threads.
+
+    Runs Whisper both with and without the kana-bias prompt and keeps
+    whichever pass scores closer to `jp_reading`. Neither pass alone is
+    reliably correct: the bias prompt fixes punctuation/segmentation-driven
+    homograph misreads (docs/audio_reading_qc.md) but can push a jukujikun
+    word (何時 -> なにじ instead of いつ) into a wrong character-by-character
+    reading, and can itself degenerate into echoing the prompt text in a
+    repetition loop on some clips. The unbiased pass is immune to both but
+    reintroduces the original punctuation-loss bug. Taking the higher-scoring
+    of the two sidesteps each pass's individual failure mode; a clip is only
+    flagged if *neither* pass reproduces the target reading.
+    """
     row_id = row["id"]
     try:
-        transcript = call_whisper(host, row["audio_path"], timeout=timeout)
-        if not transcript or not transcript.strip():
-            raise ValueError("empty transcript")
-        stt_reading = dict_reading(normalize_arabic_numerals(transcript))
         target_reading = normalize_reading(row["jp_reading"] or "")
-        a = expand_chōonpu(PUNCT_RE.sub("", stt_reading))
-        b = expand_chōonpu(PUNCT_RE.sub("", target_reading))
-        sim = difflib.SequenceMatcher(None, a, b).ratio()
+        candidates = []
+        for prompt in (KANA_BIAS_PROMPT, None):
+            text = _raw_whisper(host, row["audio_path"], prompt, timeout=timeout)
+            if not text or not text.strip():
+                continue
+            reading, sim = _score(text, target_reading)
+            candidates.append({"transcript": text, "reading": reading, "similarity": sim})
+
+        if not candidates:
+            raise ValueError("empty transcript from both biased and unbiased passes")
+
+        best = max(candidates, key=lambda c: c["similarity"])
         return {
             "id": row_id,
             "ok": True,
-            "transcript": transcript,
-            "stt_reading": stt_reading,
-            "similarity": sim,
-            "mismatch": sim < threshold,
+            "transcript": best["transcript"],
+            "stt_reading": best["reading"],
+            "similarity": best["similarity"],
+            "mismatch": best["similarity"] < threshold,
         }
     except Exception as e:
         return {"id": row_id, "ok": False, "error": str(e)[:500]}
