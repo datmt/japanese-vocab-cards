@@ -2,6 +2,9 @@ const CHUNK_SIZE = 100;
 const TOTAL_WORDS = 5000;
 const QUIZ_QUESTIONS = 10;
 const QUIZ_OPTIONS = 4;
+const FEEDBACK_FORM = 'https://docs.google.com/forms/d/e/1FAIpQLSfq0cHmELEgXmvxHRJHlXV176v0CimWy58ghNB6_9AddrpUeA/viewform';
+const FEEDBACK_ENTRY_TYPE = 'entry.1813869599';
+const FEEDBACK_ENTRY_DETAILS = 'entry.999717781';
 
 let db = null;
 let activeChunk = null;
@@ -34,26 +37,61 @@ function queryAll(sql, params = []) {
   return rows;
 }
 
+function chunkIndexForRank(rank) {
+  return Math.floor((rank - 1) / CHUNK_SIZE) + 1;
+}
+
+function chunkHash(chunkNum, rank) {
+  return rank ? `#chunk=${chunkNum}&rank=${rank}` : `#chunk=${chunkNum}`;
+}
+
+function parseHash() {
+  const m = /^#chunk=(\d+)(?:&rank=(\d+))?$/.exec(location.hash);
+  if (!m) return null;
+  let chunkNum = parseInt(m[1], 10);
+  const rank = m[2] ? parseInt(m[2], 10) : null;
+  const nChunks = Math.ceil(TOTAL_WORDS / CHUNK_SIZE);
+  if (rank != null) {
+    if (rank < 1 || rank > TOTAL_WORDS) return null;
+    chunkNum = chunkIndexForRank(rank);
+  }
+  if (chunkNum < 1 || chunkNum > nChunks) return null;
+  return { chunkNum, rank };
+}
+
 function renderSidebar() {
   const nChunks = Math.ceil(TOTAL_WORDS / CHUNK_SIZE);
-  for (let i = 0; i < nChunks; i++) {
-    const start = i * CHUNK_SIZE + 1;
-    const end = Math.min((i + 1) * CHUNK_SIZE, TOTAL_WORDS);
+  for (let i = 1; i <= nChunks; i++) {
+    const start = (i - 1) * CHUNK_SIZE + 1;
+    const end = Math.min(i * CHUNK_SIZE, TOTAL_WORDS);
     const li = document.createElement('li');
-    li.textContent = `${start}–${end}`;
-    li.dataset.start = start;
-    li.dataset.end = end;
-    li.addEventListener('click', () => {
-      document.querySelectorAll('#chunk-list li').forEach((el) => el.classList.remove('active'));
-      li.classList.add('active');
-      renderChunk(start, end);
-    });
+    li.dataset.chunk = i;
+    const a = document.createElement('a');
+    a.href = chunkHash(i);
+    a.textContent = `${start}–${end}`;
+    li.appendChild(a);
     sidebarList.appendChild(li);
   }
 }
 
-function renderChunk(start, end) {
+function handleHashChange() {
+  const parsed = parseHash();
+  document.querySelectorAll('#chunk-list li').forEach((el) => {
+    el.classList.toggle('active', parsed != null && el.dataset.chunk === String(parsed.chunkNum));
+  });
+  if (parsed == null) {
+    content.innerHTML = '<p class="hint">Pick a chunk from the left to start.</p>';
+    return;
+  }
+  const { chunkNum, rank } = parsed;
+  const start = (chunkNum - 1) * CHUNK_SIZE + 1;
+  const end = Math.min(chunkNum * CHUNK_SIZE, TOTAL_WORDS);
+  renderChunk(start, end, rank);
+}
+
+function renderChunk(start, end, focusRank) {
   activeChunk = { start, end };
+  const chunkNum = chunkIndexForRank(start);
   const words = queryAll(
     'SELECT rank, headword, reading_llm, reading_dict, gloss, pos, mnemonic, has_kanji, image_path FROM words WHERE rank BETWEEN ? AND ? ORDER BY rank',
     [start, end]
@@ -64,21 +102,45 @@ function renderChunk(start, end) {
   const header = document.createElement('div');
   header.className = 'chunk-header';
   header.innerHTML = `<h2>Words ${start}–${end}</h2>`;
+
+  const actions = document.createElement('div');
+  actions.className = 'chunk-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'primary';
+  copyBtn.textContent = 'Copy link to this batch';
+  copyBtn.addEventListener('click', () => {
+    const url = `${location.origin}${location.pathname}${chunkHash(chunkNum)}`;
+    navigator.clipboard.writeText(url).then(() => {
+      copyBtn.textContent = 'Link copied!';
+      setTimeout(() => { copyBtn.textContent = 'Copy link to this batch'; }, 1500);
+    });
+  });
+  actions.appendChild(copyBtn);
+
   const quizBtn = document.createElement('button');
   quizBtn.className = 'quiz-btn';
   quizBtn.textContent = 'Quiz this chunk';
   quizBtn.addEventListener('click', () => startQuiz(start, end));
-  header.appendChild(quizBtn);
+  actions.appendChild(quizBtn);
+
+  header.appendChild(actions);
   content.appendChild(header);
 
   const list = document.createElement('div');
-  words.forEach((w) => list.appendChild(renderWordRow(w)));
+  words.forEach((w) => list.appendChild(renderWordRow(w, chunkNum, focusRank)));
   content.appendChild(list);
+
+  if (focusRank) {
+    const focusRow = list.querySelector(`[data-rank="${focusRank}"]`);
+    if (focusRow) focusRow.scrollIntoView({ block: 'center' });
+  }
 }
 
-function renderWordRow(w) {
+function renderWordRow(w, chunkNum, focusRank) {
   const row = document.createElement('div');
   row.className = 'word-row';
+  row.dataset.rank = w.rank;
 
   const summary = document.createElement('div');
   summary.className = 'word-summary';
@@ -93,26 +155,80 @@ function renderWordRow(w) {
   `;
 
   let detailEl = null;
-  summary.addEventListener('click', () => {
-    if (detailEl) {
-      detailEl.remove();
-      detailEl = null;
-      return;
-    }
-    detailEl = renderWordDetail(w);
+  function openDetail() {
+    detailEl = renderWordDetail(w, chunkNum);
     row.appendChild(detailEl);
+    history.replaceState(null, '', chunkHash(chunkNum, w.rank));
+  }
+  function closeDetail() {
+    detailEl.remove();
+    detailEl = null;
+    history.replaceState(null, '', chunkHash(chunkNum));
+  }
+  summary.addEventListener('click', () => {
+    if (detailEl) closeDetail();
+    else openDetail();
   });
 
   row.appendChild(summary);
+  if (focusRank === w.rank) openDetail();
   return row;
 }
 
-function renderWordDetail(w) {
+function feedbackFormUrl(type, details) {
+  const params = new URLSearchParams({
+    usp: 'pp_url',
+    [FEEDBACK_ENTRY_TYPE]: type,
+    [FEEDBACK_ENTRY_DETAILS]: details,
+  });
+  return `${FEEDBACK_FORM}?${params.toString()}`;
+}
+
+function wordFeedbackUrl(w, chunkNum) {
+  const itemUrl = `${location.origin}${location.pathname}${chunkHash(chunkNum, w.rank)}`;
+  const reading = w.reading_llm || w.reading_dict || '';
+  const details = [
+    `Word: ${w.headword} (#${w.rank})`,
+    `Reading: ${reading}`,
+    `Gloss: ${w.gloss || ''}`,
+    `Link: ${itemUrl}`,
+  ].join('\n');
+  return feedbackFormUrl('Bug Report', details);
+}
+
+function renderWordDetail(w, chunkNum) {
   const detail = document.createElement('div');
   detail.className = 'word-detail';
 
   const body = document.createElement('div');
   body.className = 'detail-body';
+
+  const detailActions = document.createElement('div');
+  detailActions.className = 'detail-actions';
+
+  const copyItemBtn = document.createElement('button');
+  copyItemBtn.className = 'copy-item-link';
+  copyItemBtn.textContent = 'Copy link to this word';
+  copyItemBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const url = `${location.origin}${location.pathname}${chunkHash(chunkNum, w.rank)}`;
+    navigator.clipboard.writeText(url).then(() => {
+      copyItemBtn.textContent = 'Link copied!';
+      setTimeout(() => { copyItemBtn.textContent = 'Copy link to this word'; }, 1500);
+    });
+  });
+  detailActions.appendChild(copyItemBtn);
+
+  const reportBtn = document.createElement('a');
+  reportBtn.className = 'report-bug';
+  reportBtn.href = wordFeedbackUrl(w, chunkNum);
+  reportBtn.target = '_blank';
+  reportBtn.rel = 'noopener';
+  reportBtn.textContent = 'Report a bug / request a feature';
+  reportBtn.addEventListener('click', (e) => e.stopPropagation());
+  detailActions.appendChild(reportBtn);
+
+  body.appendChild(detailActions);
 
   if (w.has_kanji && w.mnemonic) {
     const m = document.createElement('p');
@@ -287,6 +403,8 @@ function startQuiz(start, end) {
 async function main() {
   renderSidebar();
   await initDb();
+  window.addEventListener('hashchange', handleHashChange);
+  handleHashChange();
 }
 
 main();
