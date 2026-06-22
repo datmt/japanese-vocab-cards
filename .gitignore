@@ -1,2 +1,4 @@
 __pycache__/
 *.log
+vocab.db
+vocab_backup.db

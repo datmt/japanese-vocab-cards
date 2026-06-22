@@ -23,7 +23,7 @@ async function initDb() {
   const SQL = await initSqlJs({
     locateFile: (file) => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}`,
   });
-  const buf = await fetch('./vocab.db').then((r) => r.arrayBuffer());
+  const buf = await fetch('./vocab_public.db').then((r) => r.arrayBuffer());
   db = new SQL.Database(new Uint8Array(buf));
   loading.remove();
 }
